@@ -5,14 +5,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use hyper::server::conn::AddrStream;
 use openssl::ssl::Ssl;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
-use crate::{acceptor::SslConfig, certificate::CertificateVerifier};
+use crate::{certificate::CertificateVerifier, config::SslConfig};
 
-pub(crate) type CloneableStream = Arc<Mutex<SslStream<AddrStream>>>;
+pub(crate) type CloneableStream = Arc<Mutex<SslStream<TcpStream>>>;
 
 enum AcceptState {
     Pending,
@@ -34,7 +34,7 @@ pub(crate) struct TlsStream {
 
 impl TlsStream {
     pub(crate) fn new(
-        stream: AddrStream,
+        stream: TcpStream,
         ssl_config: &SslConfig,
     ) -> std::result::Result<TlsStream, io::Error> {
         let ssl = Ssl::new(ssl_config.acceptor.context()).map_err(io::Error::from)?;
@@ -79,7 +79,7 @@ impl TlsStream {
                                     "Certificate validation failed for certificate: {:?}",
                                     cert
                                 );
-                                io::Error::new(io::ErrorKind::Other, err)
+                                io::Error::other(err)
                             })?
                     }
                 }
@@ -88,9 +88,7 @@ impl TlsStream {
             Poll::Ready(Err(e)) => {
                 // Log the error in case of cert verification falilure otherwise warp silently ignores this
                 tracing::error!("Error in poll_accept: {:?}", e);
-                Err(e
-                    .into_io_error()
-                    .unwrap_or_else(|e| io::Error::new(io::ErrorKind::Other, e)))
+                Err(e.into_io_error().unwrap_or_else(io::Error::other))
             }
             Poll::Pending => Ok(AcceptState::Pending),
         }

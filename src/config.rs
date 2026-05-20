@@ -15,7 +15,12 @@ use openssl::{
     },
 };
 
-use crate::{acceptor::SslConfig, certificate::CertificateVerifier, server::TlsLevel};
+use crate::{certificate::CertificateVerifier, server::TlsLevel};
+
+pub(crate) struct SslConfig {
+    pub(crate) acceptor: SslAcceptor,
+    pub(crate) certificate_verifier: Option<Arc<dyn CertificateVerifier>>,
+}
 
 /// Represents errors that can occur building the TlsConfig
 #[derive(Debug)]
@@ -177,7 +182,7 @@ impl TlsConfigBuilder {
                 SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
             }
         };
-        
+
         let mut acceptor = acceptor.map_err(TlsConfigError::OpensslError)?;
         acceptor
             .set_private_key(&private_key)
@@ -289,7 +294,7 @@ impl TlsConfigBuilder {
         };
 
         if let Ok(filename) = env::var("SSLKEYLOGFILE") {
-            let file = Mutex::new(File::create(filename).unwrap());
+            let file = Mutex::new(File::create(filename).map_err(TlsConfigError::Io)?);
 
             acceptor.set_keylog_callback(move |_ssl, line| {
                 let mut file = file.lock().unwrap();

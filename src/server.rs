@@ -1,70 +1,21 @@
 use std::net::SocketAddr;
-
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crate::acceptor::TlsAcceptor;
 use crate::certificate::{Certificate, CertificateVerifier};
-use crate::config::{LookupFileFn, LookupHashDirFn, TlsConfigBuilder};
-use crate::stream::CloneableStream;
+use crate::config::{LookupFileFn, LookupHashDirFn, SslConfig, TlsConfigBuilder};
+use crate::stream::{CloneableStream, TlsStream};
 use crate::Result;
 
-use futures_util::FutureExt;
 use futures_util::{Future, TryFuture};
 
-use hyper::server::conn::AddrIncoming;
-use openssl::ssl::{SslAcceptorBuilder, SslContext};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
 
-use std::convert::Infallible;
+use tokio::net::TcpListener;
 use warp::{Filter, Reply};
-
-use hyper::service::{make_service_fn, Service};
-use hyper::Server as HyperServer;
-use hyper::{Body, Request};
-
-macro_rules! addr_incoming {
-    ($addr:expr) => {{
-        let mut incoming = AddrIncoming::bind($addr)?;
-        incoming.set_nodelay(true);
-        let addr = incoming.local_addr();
-        (addr, incoming)
-    }};
-}
-macro_rules! bind {
-    ($this:ident, $addr:expr) => {{
-        let tls = $this.tls.build()?;
-        let addr = $addr.into();
-        let (addr, incoming) = addr_incoming!(&addr);
-        let service = warp::service($this.filter);
-        let make_svc = make_service_fn(move |stream| {
-            let stream: CloneableStream = {
-                let stream: &crate::stream::TlsStream = stream;
-                stream.stream()
-            };
-
-            let mut service = service.clone();
-            let svc = hyper::service::service_fn(move |mut req: Request<Body>| {
-                let certificate: Option<Certificate> = stream
-                    .lock()
-                    .ok()
-                    .and_then(|stream| stream.ssl().peer_certificate())
-                    .and_then(|peer_certificate| peer_certificate.try_into().ok());
-
-                if let Some(certificate) = certificate {
-                    req.extensions_mut().insert(certificate);
-                };
-
-                service.call(req)
-            });
-
-            // let remote_addr = socket.remote_addr();
-            let svc = svc.clone();
-            async move { Ok::<_, Infallible>(svc.clone()) }
-        });
-
-        let srv = HyperServer::builder(TlsAcceptor::new(tls, incoming)).serve(make_svc);
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((addr, srv))
-    }};
-}
 
 /// Create an `OpensslServer` with the provided `Filter`.
 pub fn serve<F>(filter: F) -> OpensslServer<F> {
@@ -102,8 +53,6 @@ pub struct OpensslServer<F> {
     tls: TlsConfigBuilder,
 }
 
-// // ===== impl TlsServer =====
-
 impl<F> OpensslServer<F>
 where
     F: Filter + Clone + Send + Sync + 'static,
@@ -121,10 +70,7 @@ where
     /// Defaults to `TlsLevel::MozillaIntermediateV5`.
     ///
     /// [docs]: https://wiki.mozilla.org/Security/Server_Side_TLS
-    pub fn tls_level<T>(self, tls_level: TlsLevel) -> Self
-    where
-        T: FnMut(&mut SslContext) -> Result<SslAcceptorBuilder>,
-    {
+    pub fn tls_level(self, tls_level: TlsLevel) -> Self {
         self.with_tls(|tls| tls.tls_level(tls_level))
     }
 
@@ -190,19 +136,56 @@ where
         OpensslServer { filter, tls }
     }
 
-    /// Create a tls server bound to a sepecific port.
+    fn build_server(
+        self,
+        addr: impl Into<SocketAddr>,
+    ) -> Result<(SocketAddr, TcpListener, SslConfig, F)> {
+        let ssl_config = self.tls.build()?;
+        let addr = addr.into();
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(std_listener)?;
+        let local_addr = listener.local_addr()?;
+        Ok((local_addr, listener, ssl_config, self.filter))
+    }
+
+    /// Create a tls server bound to a specific port.
     ///
     pub fn bind(
         self,
         addr: impl Into<SocketAddr>,
     ) -> Result<(SocketAddr, impl Future<Output = ()> + 'static)> {
-        let (addr, srv) = bind!(self, addr)?;
+        let (addr, listener, ssl_config, filter) = self.build_server(addr)?;
+        let ssl_config = Arc::new(ssl_config);
 
-        let srv = srv.map(|result| {
-            if let Err(err) = result {
-                tracing::error!("server error: {}", err)
+        let srv = async move {
+            let builder = auto::Builder::new(TokioExecutor::new());
+            loop {
+                let (tcp_stream, remote_addr) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::error!("accept error: {}", e);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = tcp_stream.set_nodelay(true) {
+                    tracing::warn!("set_nodelay failed for {}: {}", remote_addr, e);
+                }
+
+                let ssl_config = ssl_config.clone();
+                let filter = filter.clone();
+                let builder = builder.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        serve_connection(tcp_stream, &ssl_config, filter, &builder).await
+                    {
+                        tracing::error!("connection error: {}", e);
+                    }
+                });
             }
-        });
+        };
 
         Ok((addr, srv))
     }
@@ -217,13 +200,135 @@ where
         addr: impl Into<SocketAddr>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(SocketAddr, impl Future<Output = ()> + 'static)> {
-        let (addr, srv) = bind!(self, addr)?;
-        let srv = srv.with_graceful_shutdown(signal).map(|result| {
-            if let Err(err) = result {
-                tracing::error!("server error: {}", err)
+        let (addr, listener, ssl_config, filter) = self.build_server(addr)?;
+        let ssl_config = Arc::new(ssl_config);
+
+        let srv = async move {
+            let builder = auto::Builder::new(TokioExecutor::new());
+            let graceful = GracefulShutdown::new();
+            let mut signal = std::pin::pin!(signal);
+
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        let (tcp_stream, remote_addr) = match result {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                tracing::error!("accept error: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = tcp_stream.set_nodelay(true) {
+                            tracing::warn!("set_nodelay failed for {}: {}", remote_addr, e);
+                        }
+
+                        let ssl_config = ssl_config.clone();
+                        let filter = filter.clone();
+                        let builder = builder.clone();
+                        let watcher = graceful.watcher();
+
+                        tokio::spawn(async move {
+                            let tls_stream = match TlsStream::new(tcp_stream, &ssl_config) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!("TLS stream creation error: {}", e);
+                                    return;
+                                }
+                            };
+
+                            let stream_ref = tls_stream.stream();
+                            let svc = CertInjectorService {
+                                inner: warp::service(filter),
+                                stream: stream_ref,
+                            };
+
+                            let conn = builder.serve_connection(
+                                TokioIo::new(tls_stream),
+                                TowerToHyperService::new(svc),
+                            );
+                            let conn = watcher.watch(conn.into_owned());
+
+                            if let Err(e) = conn.await {
+                                tracing::error!("connection error: {}", e);
+                            }
+                        });
+                    }
+                    _ = &mut signal => {
+                        break;
+                    }
+                }
             }
-        });
+
+            graceful.shutdown().await;
+        };
 
         Ok((addr, srv))
+    }
+}
+
+async fn serve_connection<F>(
+    tcp_stream: tokio::net::TcpStream,
+    ssl_config: &SslConfig,
+    filter: F,
+    builder: &auto::Builder<TokioExecutor>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Filter + Clone + Send + Sync + 'static,
+    <F::Future as TryFuture>::Ok: Reply,
+{
+    let tls_stream = TlsStream::new(tcp_stream, ssl_config)?;
+    let stream_ref = tls_stream.stream();
+
+    let svc = CertInjectorService {
+        inner: warp::service(filter),
+        stream: stream_ref,
+    };
+
+    builder
+        .serve_connection(TokioIo::new(tls_stream), TowerToHyperService::new(svc))
+        .await?;
+
+    Ok(())
+}
+
+/// A service wrapper that injects the peer certificate into request extensions.
+#[derive(Clone)]
+struct CertInjectorService<S> {
+    inner: S,
+    stream: CloneableStream,
+}
+
+impl<S, B> tower_service::Service<http::Request<B>> for CertInjectorService<S>
+where
+    S: tower_service::Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
+        let certificate: Option<Certificate> = self
+            .stream
+            .lock()
+            .ok()
+            .and_then(|stream| stream.ssl().peer_certificate())
+            .and_then(|peer_certificate| peer_certificate.try_into().ok());
+
+        if let Some(certificate) = certificate {
+            req.extensions_mut().insert(certificate);
+        }
+
+        self.inner.call(req)
+    }
+}
+
+impl<S> std::fmt::Debug for CertInjectorService<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertInjectorService").finish()
     }
 }

@@ -1,5 +1,3 @@
-#!/bin/sh
-
 openssl ecparam -out ca.key -name prime256v1 -genkey
 openssl req -new -sha256 -key ca.key -out ca.csr -batch -subj '/CN=CA'
 openssl x509 -req -sha256 -extensions v3_ca  -days 3650 -in ca.csr -signkey ca.key -out ca.crt

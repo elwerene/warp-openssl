@@ -1,8 +1,5 @@
-basicConstraints=critical,CA:TRUE,pathlen:1
+basicConstraints=critical,pathlen:1
 
-[ ca ]
-
-default_ca = CA
 
 [ CA ]
 

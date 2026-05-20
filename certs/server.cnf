@@ -1,2 +1,24 @@
 extendedKeyUsage=serverAuth
 subjectAltName=DNS:localhost
+
+[ ca ]
+
+default_ca = CA
+
+[ CA ]
+
+# How long the CA certificate is valid for
+default_days = 3650
+# default_startdate  = 180517000000Z
+# default_enddate    = 181231235959Z
+
+# The message digest for self-signing the certificate
+# sha1 or sha256 for best compatability, although most
+# OpenSSL digest algorithm can be used.
+# md4,md5,mdc2,rmd160,sha1,sha256
+default_md = sha256
+
+# Subjects don't have to be unique in this CA's database
+unique_subject    = no
+# What to do with CSR extensions
+copy_extensions    = copy

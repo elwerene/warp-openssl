@@ -35,8 +35,7 @@ async fn main() -> Result<()> {
 
     let trust_root = Certificate::from_pem(&ca_cert).unwrap();
     let builder = ClientBuilder::new()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
+        .tls_backend_rustls()
         .min_tls_version(Version::TLS_1_2)
         .add_root_certificate(trust_root);
 

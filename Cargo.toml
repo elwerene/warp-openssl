@@ -1,6 +1,6 @@
 [package]
 name = "warp-openssl"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 description = "OpenSSL bindings for Warp TLS server"
 license = "MIT"

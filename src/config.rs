@@ -293,6 +293,12 @@ impl TlsConfigBuilder {
             }
         };
 
+        // Required to avoid "session id context uninitialized" errors when
+        // clients attempt TLS session resumption.
+        acceptor
+            .set_session_id_context(b"warp-openssl")
+            .map_err(TlsConfigError::OpensslError)?;
+
         if let Ok(filename) = env::var("SSLKEYLOGFILE") {
             let file = Mutex::new(File::create(filename).map_err(TlsConfigError::Io)?);
 
